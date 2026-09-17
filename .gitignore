@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build*/
+source*/
+results/
+*.gguf
+*.so
+*.so.*
+.env
+.env.*

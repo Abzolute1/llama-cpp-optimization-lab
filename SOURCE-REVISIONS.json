@@ -1,0 +1,24 @@
+{
+  "qwen35": {
+    "repository": "https://github.com/TheTom/llama-cpp-turboquant",
+    "commit": "bd1bf025fc55ffa1fcb2ba6d8bb8805f35671d1f"
+  },
+  "flash_next": {
+    "repository": "https://github.com/unslothai/llama.cpp",
+    "commit": "329b6160f513915f1c607dbfae3d5ce864a64a4f",
+    "source_archives": [
+      {
+        "asset": "llama.cpp-source-commit-92cedc8679d145902ead3f006258e8672eac11e6.tar.gz",
+        "url": "https://github.com/unslothai/llama.cpp/releases/download/b10715-mix-86bd2d3/llama.cpp-source-commit-92cedc8679d145902ead3f006258e8672eac11e6.tar.gz",
+        "sha256": "0cc7f57a8456d07bf104f2a77a3d1995b6c367d0f33fca253725ec2e362439cc",
+        "bytes": 37453825
+      },
+      {
+        "asset": "llama.cpp-source-commit-329b6160f513915f1c607dbfae3d5ce864a64a4f.tar.gz",
+        "url": "https://github.com/unslothai/llama.cpp/releases/download/b10909-mix-bea84f7/llama.cpp-source-commit-329b6160f513915f1c607dbfae3d5ce864a64a4f.tar.gz",
+        "sha256": "9d46c7ce4da17fa584df7d906209ff79f2b827a97b9fe57cd9652b29c55a6ca5",
+        "bytes": 37739417
+      }
+    ]
+  }
+}

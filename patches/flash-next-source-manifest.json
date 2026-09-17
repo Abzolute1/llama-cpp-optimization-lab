@@ -1,0 +1,21 @@
+{
+  "base_commit": "329b6160f513915f1c607dbfae3d5ce864a64a4f",
+  "files": [
+    {
+      "path": "src/llama-mmap.cpp",
+      "before_sha256": "b8cfc8b098ee11de376651961d7829b4eaea9a0b3aafd67bc3fbda3c4bd84bb2",
+      "after_sha256": "7f9868ed283231bed5e5997fdd1a2ae0d858830093fe83db710b430a8ac477e8"
+    },
+    {
+      "path": "src/llama-model.cpp",
+      "before_sha256": "aa2fb7734b81a396057932b5af8184a231319c2701c31cb2071deab672fa40de",
+      "after_sha256": "268d1f0a7e61955bf1c8577454b8e1334724638a48ac8fb82695252b408b9f2a"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/fattn-vec.cuh",
+      "before_sha256": "deb732ee1f1007814d95943ce48f3eec228087bac986c2bfcf8191a65706cfe7",
+      "after_sha256": "873337dcb8e2118ade29172e73a40def293ca6cd4d1d4e11b6bf9d3a8315a9bd"
+    }
+  ],
+  "adaptation": "Custom environment-variable prefixes renamed to LLAMA_EXPERIMENT_; source logic otherwise unchanged. Requires rebuilding; existing binaries use the historical names."
+}

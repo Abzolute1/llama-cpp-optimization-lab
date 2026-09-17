@@ -1,0 +1,621 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1857,6 +1857,18 @@
+                         prev_ids_tensor = ids_tensor;
+                     }
+ 
++                    using stage_host_weights_fn = bool (*)(ggml_backend_t, const ggml_tensor *, ggml_tensor *, size_t, size_t);
++                    stage_host_weights_fn stage_host_weights = nullptr;
++                    const char * stage_env = getenv("GGML_CUDA_MOE_STAGING");
++                    if (stage_env && strcmp(stage_env, "1") == 0) {
++                        auto * dev = ggml_backend_get_device(split_backend);
++                        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++                        if (reg) {
++                            stage_host_weights = (stage_host_weights_fn)ggml_backend_reg_get_proc_address(
++                                    reg, "ggml_backend_stage_host_weights_async");
++                        }
++                    }
++
+                     // group consecutive experts and copy them together
+                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                         const size_t expert_offset = first_id * expert_size;
+@@ -1864,6 +1876,10 @@
+                         const size_t padding = std::min<size_t>(expert_size, 512);
+                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+ 
++                        if (stage_host_weights && stage_host_weights(split_backend, input, input_cpy,
++                                expert_offset, expert_size_copy + padding_end)) {
++                            return;
++                        }
+                         ggml_backend_tensor_set_async(split_backend,
+                             input_cpy,
+                             (const uint8_t *)input->data + expert_offset, expert_offset,
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2531,9 +2531,192 @@
+     return cuda_ctx->name.c_str();
+ }
+ 
++// Process-local experiment; no backend/context struct layout changes.
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++static bool ggml_cuda_moe_staging_enabled() {
++    static const bool enabled = [] {
++        const char * value = getenv("GGML_CUDA_MOE_STAGING");
++        return value && strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++struct ggml_cuda_moe_stage_slot {
++    void * host = nullptr;
++    cudaEvent_t ready = nullptr;
++    bool pending = false;
++};
++
++struct ggml_cuda_moe_stage_state {
++    explicit ggml_cuda_moe_stage_state(int dev) : device(dev) {}
++    int device;
++    std::mutex mutex;
++    std::array<ggml_cuda_moe_stage_slot, 3> slots;
++    size_t chunk = 8 * 1024 * 1024;
++    size_t next = 0;
++    int n_slots = 2;
++    bool initialized = false, disabled = false, closed = false;
++    uint64_t calls = 0, bytes = 0, waits = 0;
++
++    void release() {
++        ggml_cuda_set_device(device);
++        for (auto & slot : slots) {
++            if (slot.pending) {
++                CUDA_CHECK(cudaEventSynchronize(slot.ready));
++                slot.pending = false;
++            }
++            if (slot.ready) {
++                CUDA_CHECK(cudaEventDestroy(slot.ready));
++                slot.ready = nullptr;
++            }
++            if (slot.host) {
++                CUDA_CHECK(cudaFreeHost(slot.host));
++                slot.host = nullptr;
++            }
++        }
++    }
++    ~ggml_cuda_moe_stage_state() { release(); }
++    bool initialize() {
++        if (initialized) return true;
++        if (disabled || closed) return false;
++        const char * chunk_env = getenv("GGML_CUDA_MOE_STAGING_CHUNK_MB");
++        const char * slots_env = getenv("GGML_CUDA_MOE_STAGING_SLOTS");
++        auto parse = [](const char * value, long fallback, long low, long high) {
++            if (!value) return fallback;
++            char * end = nullptr;
++            const long result = strtol(value, &end, 10);
++            return end != value && !*end && result >= low && result <= high ? result : -1L;
++        };
++        const long chunk_mb = parse(chunk_env, 8, 1, 64);
++        const long count = parse(slots_env, 2, 2, 3);
++        if (chunk_mb < 0 || count < 0) {
++            disabled = true;
++            GGML_LOG_WARN("MoE staging: invalid chunk/slot setting; original transfer path\n");
++            return false;
++        }
++        chunk = size_t(chunk_mb) * 1024 * 1024;
++        n_slots = int(count);
++        ggml_cuda_set_device(device);
++        for (int i = 0; i < n_slots; ++i) {
++            void * host = nullptr;
++            cudaError_t status = cudaMallocHost(&host, chunk);
++            if (status == cudaSuccess) {
++                slots[i].host = host;
++                cudaEvent_t event = nullptr;
++                status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
++                if (status == cudaSuccess) slots[i].ready = event;
++            }
++            if (status != cudaSuccess) {
++                GGML_LOG_WARN("MoE staging: allocation failed (%s); original transfer path\n", cudaGetErrorString(status));
++                (void)cudaGetLastError();
++                release();
++                disabled = true;
++                return false;
++            }
++        }
++        initialized = true;
++        GGML_LOG_INFO("MoE staging: CUDA%d pinned ring %d x %zu bytes\n", device, n_slots, chunk);
++        return true;
++    }
++};
++
++struct ggml_cuda_moe_stage_registry {
++    std::mutex mutex;
++    std::map<ggml_backend_cuda_context *, std::shared_ptr<ggml_cuda_moe_stage_state>> contexts;
++};
++static ggml_cuda_moe_stage_registry & ggml_cuda_moe_stages() {
++    static auto * registry = new ggml_cuda_moe_stage_registry;
++    return *registry;
++}
++
++static void ggml_cuda_moe_stage_free(ggml_backend_cuda_context * ctx) {
++    if (!ggml_cuda_moe_staging_enabled()) return;
++    std::shared_ptr<ggml_cuda_moe_stage_state> state;
++    auto & registry = ggml_cuda_moe_stages();
++    {
++        std::lock_guard<std::mutex> lock(registry.mutex);
++        auto it = registry.contexts.find(ctx);
++        if (it == registry.contexts.end()) return;
++        state = std::move(it->second);
++        registry.contexts.erase(it);
++    }
++    if (!state) return;
++    std::lock_guard<std::mutex> lock(state->mutex);
++    state->closed = true;
++    state->release();
++    GGML_LOG_INFO("MoE staging: CUDA%d calls=%llu bytes=%llu slot-reuse-waits=%llu\n", ctx->device,
++                  (unsigned long long)state->calls, (unsigned long long)state->bytes, (unsigned long long)state->waits);
++}
++
++static bool ggml_backend_cuda_stage_host_weights_async(
++        ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, size_t offset, size_t size) {
++    if (!ggml_cuda_moe_staging_enabled() || !ggml_backend_is_cuda(backend) ||
++            !src || !dst || src->view_src || dst->view_src || !src->data || !dst->data ||
++            !src->buffer || !dst->buffer || src->op != GGML_OP_NONE || ggml_n_dims(src) != 3 ||
++            !strstr(src->name, "_exps") || src->type != dst->type || size < 256 * 1024 ||
++            ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
++            !ggml_backend_buffer_is_host(src->buffer) ||
++            strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(src->buffer)), "CPU_Mapped") != 0) {
++        return false;
++    }
++    if (src->type != GGML_TYPE_Q4_K && src->type != GGML_TYPE_Q5_K && src->type != GGML_TYPE_Q6_K) return false;
++    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++        if (src->ne[i] != dst->ne[i] || src->nb[i] != dst->nb[i]) return false;
++    }
++    if (offset > ggml_nbytes(src) || size > ggml_nbytes(src) - offset ||
++            offset > ggml_nbytes(dst) || size > ggml_nbytes(dst) - offset) return false;
++    auto * ctx = (ggml_backend_cuda_context *)backend->context;
++    if (dst->buffer->buft != ggml_backend_cuda_buffer_type(ctx->device)) return false;
++
++    ggml_cuda_set_device(ctx->device);
++    const cudaStream_t stream = ctx->stream();
++    cudaStreamCaptureStatus capture;
++    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
++    if (capture != cudaStreamCaptureStatusNone) return false;
++
++    std::shared_ptr<ggml_cuda_moe_stage_state> state;
++    try {
++        auto & registry = ggml_cuda_moe_stages();
++        std::lock_guard<std::mutex> lock(registry.mutex);
++        auto & entry = registry.contexts[ctx];
++        if (!entry) entry = std::make_shared<ggml_cuda_moe_stage_state>(ctx->device);
++        state = entry;
++    } catch (...) {
++        GGML_LOG_WARN_ONCE("MoE staging: bookkeeping allocation failed; original transfer path\n");
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(state->mutex);
++    if (state->closed || !state->initialize()) return false;
++
++    const auto * input = (const uint8_t *)src->data + offset;
++    auto * output = (uint8_t *)dst->data + offset;
++    for (size_t copied = 0; copied < size;) {
++        auto & slot = state->slots[state->next];
++        if (slot.pending) {
++            CUDA_CHECK(cudaEventSynchronize(slot.ready));
++            slot.pending = false;
++            ++state->waits;
++        }
++        const size_t count = std::min(state->chunk, size - copied);
++        memcpy(slot.host, input + copied, count);
++        CUDA_CHECK(cudaMemcpyAsync(output + copied, slot.host, count, cudaMemcpyHostToDevice, stream));
++        CUDA_CHECK(cudaEventRecord(slot.ready, stream));
++        slot.pending = true;
++        state->next = (state->next + 1) % state->n_slots;
++        copied += count;
++    }
++    ++state->calls;
++    state->bytes += size;
++    return true;
++}
++#endif
++
+ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    ggml_cuda_moe_stage_free(cuda_ctx);
++#endif
+     delete cuda_ctx;
+     delete backend;
+ }
+@@ -5518,6 +5701,11 @@
+     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+     }
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (strcmp(name, "ggml_backend_stage_host_weights_async") == 0) {
++        return (void *)ggml_backend_cuda_stage_host_weights_async;
++    }
++#endif
+     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
+         return (void *)ggml_backend_cuda_register_host_buffer;
+     }
+--- a/ggml/src/ggml-cuda/moe-cache.cu
++++ b/ggml/src/ggml-cuda/moe-cache.cu
+@@ -54,6 +54,34 @@
+ static constexpr size_t moe_cache_slab_bytes_auto_min         = 1ull << 30;
+ static constexpr int    moe_cache_node_rows_max               = 64;
+ static constexpr size_t moe_cache_overlap_bytes_per_token     = 8u << 20;
++// Capacity and activation policy are distinct: default scratch/accounting stays 64.
++static constexpr int moe_cache_ordinary_rows_capacity = 256;
++static constexpr int moe_cache_rows17_capacity = 136;
++static constexpr int moe_cache_extended_batch_max = 17;
++static bool moe_cache_extended_rows_enabled() {
++    static const bool enabled = [] {
++        const char * value = getenv("GGML_CUDA_MOE_CACHE_ROWS17");
++        return value && strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++static bool moe_cache_rows32_enabled() {
++    static const bool enabled = [] {
++        const char * value = getenv("GGML_CUDA_MOE_CACHE_ROWS32");
++        return value && strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++static int moe_cache_ordinary_rows_limit() {
++    if (moe_cache_rows32_enabled()) return moe_cache_ordinary_rows_capacity;
++    return moe_cache_extended_rows_enabled()
++        ? moe_cache_rows17_capacity : moe_cache_node_rows_max;
++}
++static int moe_cache_config_batch_limit() {
++    if (moe_cache_rows32_enabled()) return 32;
++    return moe_cache_extended_rows_enabled()
++        ? moe_cache_extended_batch_max : moe_cache_batch_max;
++}
+ 
+ enum class moe_cache_slot_state : uint8_t {
+     free,
+@@ -292,7 +320,7 @@
+     int64_t n_tokens = 0;
+     int wtype = -1;
+     std::unique_lock<std::mutex> dispatch_lock;
+-    moe_cache_pin pins[2 * moe_cache_node_rows_max];
++    moe_cache_pin pins[2 * moe_cache_ordinary_rows_capacity];
+     int n_pins = 0;
+     bool planned = false;
+     bool dispatched = false;
+@@ -528,7 +556,7 @@
+             : moe_cache_expert_bytes_pre_ampere_min;
+     }
+     if (!config.max_batch_explicit) {
+-        config.max_batch = moe_cache_batch_max;
++        config.max_batch = moe_cache_config_batch_limit();
+     }
+     if (!config.overlap_cpu_rows_explicit) {
+         config.overlap_cpu_rows = -1;
+@@ -573,7 +601,7 @@
+         config.min_expert_explicit = true;
+     }
+     if (moe_cache_env_i64(
+-            "GGML_CUDA_MOE_CACHE_MAX_BATCH", 1, moe_cache_batch_max, value)) {
++            "GGML_CUDA_MOE_CACHE_MAX_BATCH", 1, moe_cache_config_batch_limit(), value)) {
+         config.max_batch = (int)value;
+         config.max_batch_explicit = true;
+     }
+@@ -845,7 +873,7 @@
+ 
+ static bool moe_cache_scratch_requirements(
+         int64_t n_in, int64_t n_out, moe_cache_scratch & result) {
+-    constexpr size_t max_rows = moe_cache_node_rows_max;
++    const size_t max_rows = (size_t)moe_cache_ordinary_rows_limit();
+     if (n_in <= 0 || n_out <= 0 ||
+         n_in > INT64_MAX - (MATRIX_ROW_PADDING - 1)) {
+         return false;
+@@ -1528,7 +1556,7 @@
+                 supplied_config->min_expert_explicit < 0 ||
+                 supplied_config->min_expert_explicit > 1 ||
+                 supplied_config->max_batch < 1 ||
+-                supplied_config->max_batch > moe_cache_batch_max ||
++                supplied_config->max_batch > moe_cache_config_batch_limit() ||
+                 supplied_config->min_devices < 1 ||
+                 supplied_config->min_compute_capability < 0 ||
+                 supplied_config->min_compute_capability > 999 ||
+@@ -1855,11 +1883,11 @@
+         }
+         return nullptr;
+     }
+-    if (n_rows > moe_cache_node_rows_max) {
++    if (n_rows > moe_cache_ordinary_rows_limit()) {
+         bool expected = false;
+         if (session->row_bypass_announced.compare_exchange_strong(expected, true)) {
+             MOE_CACHE_LOG("[moe-cache] bypassing %lld-row node above row limit=%d; the stock CPU path remains active\n",
+-                    (long long)n_rows, moe_cache_node_rows_max);
++                    (long long)n_rows, moe_cache_ordinary_rows_limit());
+         }
+         return nullptr;
+     }
+@@ -2291,7 +2319,7 @@
+         void * opaque, const int32_t * ids, int n_ids, int32_t * slot_indices) {
+     moe_cache_node * node = (moe_cache_node *)opaque;
+     if (!node || !ids || !slot_indices || n_ids < 0 ||
+-        n_ids > moe_cache_node_rows_max || node->planned) {
++        n_ids > moe_cache_ordinary_rows_limit() || node->planned) {
+         return 0;
+     }
+     node->planned = true;
+@@ -2373,7 +2401,7 @@
+     moe_cache_node * node = (moe_cache_node *)opaque;
+     const bool fused = gate_pool != nullptr;
+     if (!node || !node->planned || node->dispatched || n_hits <= 0 ||
+-        n_hits > moe_cache_node_rows_max ||
++        n_hits > (fused ? moe_cache_node_rows_max : moe_cache_ordinary_rows_limit()) ||
+         n_hits * (fused ? 2 : 1) != node->n_pins ||
+         !slot_indices || !act_rows ||
+         (fused && (!gate_slot_indices ||
+@@ -2409,8 +2437,8 @@
+         }
+     }
+ 
+-    const float * unique_act_rows[moe_cache_node_rows_max];
+-    int32_t activation_indices[moe_cache_node_rows_max];
++    const float * unique_act_rows[moe_cache_ordinary_rows_capacity];
++    int32_t activation_indices[moe_cache_ordinary_rows_capacity];
+     int activation_rows = 0;
+     bool modulo_activation = true;
+     for (int index = 0; index < n_hits; index++) {
+@@ -2590,7 +2618,7 @@
+     moe_cache_node * node = (moe_cache_node *)opaque;
+     const int pins_per_hit = node && node->host_base2 ? 2 : 1;
+     if (!node || !node->dispatched || n_hits <= 0 ||
+-        n_hits > moe_cache_node_rows_max ||
++        n_hits > (pins_per_hit == 2 ? moe_cache_node_rows_max : moe_cache_ordinary_rows_limit()) ||
+         n_hits * pins_per_hit != node->n_pins ||
+         !dst_rows || n_out != node->n_out) {
+         return 0;
+@@ -2736,11 +2764,11 @@
+     if (up->expert_size < session->config.min_expert_bytes) {
+         return nullptr;
+     }
+-    if (n_tokens > session->config.max_batch) {
++    if (n_tokens > std::min(session->config.max_batch, moe_cache_batch_max)) {
+         bool expected = false;
+         if (session->batch_bypass_announced.compare_exchange_strong(expected, true)) {
+             MOE_CACHE_LOG("[moe-cache] bypassing %lld-token fused node above max-batch=%d; increase the limit only when decode or speculative batches benefit on this hardware\n",
+-                    (long long)n_tokens, session->config.max_batch);
++                    (long long)n_tokens, std::min(session->config.max_batch, moe_cache_batch_max));
+         }
+         return nullptr;
+     }
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1504,7 +1504,19 @@
+ // ggml_compute_forward_mul_mat_id
+ 
+ #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
++// Fused masks and work state intentionally remain limited to one uint64_t.
+ #define MOE_CACHE_MAX_TOPK 64
++#define MOE_CACHE_ORDINARY_ROWS_CAPACITY 256
++static bool ggml_moe_cache_extended_rows_enabled(void) {
++    // Process-start configuration; changing environment during graph work is unsupported.
++    const char * value = getenv("GGML_CUDA_MOE_CACHE_ROWS17");
++    return value && strcmp(value, "1") == 0;
++}
++
++static bool ggml_moe_cache_rows32_enabled(void) {
++    const char * value = getenv("GGML_CUDA_MOE_CACHE_ROWS32");
++    return value && strcmp(value, "1") == 0;
++}
+ 
+ struct mmid_row_mapping {
+     int32_t i1;
+@@ -1628,16 +1640,19 @@
+         ids->ne[0] <= INT64_MAX / ids->ne[1]
+         ? ids->ne[0] * ids->ne[1] : INT64_MAX;
+     const bool moe_cache_rows_fit =
+-        moe_cache_n_rows <= MOE_CACHE_MAX_TOPK;
++        moe_cache_n_rows <= MOE_CACHE_MAX_TOPK ||
++        (moe_cache_n_rows <= 136 && ggml_moe_cache_extended_rows_enabled()) ||
++        (moe_cache_n_rows <= MOE_CACHE_ORDINARY_ROWS_CAPACITY &&
++         ggml_moe_cache_rows32_enabled());
+     void *        moe_cache_node = NULL;
+     int           moe_cache_n_hits = 0;
+-    int32_t       moe_cache_slot_idx[MOE_CACHE_MAX_TOPK];
+-    int32_t       moe_cache_compact[MOE_CACHE_MAX_TOPK];
+-    int32_t       moe_cache_experts[MOE_CACHE_MAX_TOPK];
+-    int32_t       moe_cache_ids[MOE_CACHE_MAX_TOPK];
+-    int32_t       moe_cache_tokens[MOE_CACHE_MAX_TOPK];
+-    const float * moe_cache_acts[MOE_CACHE_MAX_TOPK];
+-    float *       moe_cache_rows[MOE_CACHE_MAX_TOPK];
++    int32_t       moe_cache_slot_idx[MOE_CACHE_ORDINARY_ROWS_CAPACITY];
++    int32_t       moe_cache_compact[MOE_CACHE_ORDINARY_ROWS_CAPACITY];
++    int32_t       moe_cache_experts[MOE_CACHE_ORDINARY_ROWS_CAPACITY];
++    int32_t       moe_cache_ids[MOE_CACHE_ORDINARY_ROWS_CAPACITY];
++    int32_t       moe_cache_tokens[MOE_CACHE_ORDINARY_ROWS_CAPACITY];
++    const float * moe_cache_acts[MOE_CACHE_ORDINARY_ROWS_CAPACITY];
++    float *       moe_cache_rows[MOE_CACHE_ORDINARY_ROWS_CAPACITY];
+ 
+     void * wdata_cur = params->wdata;
+ 
+@@ -1712,7 +1727,7 @@
+                 moe_cache.end(moe_cache_node);
+                 moe_cache_node = NULL;
+             } else if (moe_cache_node) {
+-                int32_t expert_ids[MOE_CACHE_MAX_TOPK];
++                int32_t expert_ids[MOE_CACHE_ORDINARY_ROWS_CAPACITY];
+                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                     for (int id = 0; id < n_ids; ++id) {
+                         expert_ids[iid1*n_ids + id] = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -10,9 +10,91 @@
+ #include <array>
+ #include <cinttypes>
+ #include <cstdint>
++#include <cstdlib>
++
++#if defined(__linux__)
++#include <cerrno>
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
+ #include <cstring>
+ #include <future>
+ #include <regex>
++
++
++static bool llama_mmap_experiment_enabled(const char * name) {
++    const char * value = std::getenv(name);
++    return value && std::strcmp(value, "1") == 0;
++}
++
++static bool llama_mmap_cuda_device(ggml_backend_dev_t dev) {
++    if (!dev) {
++        return false;
++    }
++    auto * reg = ggml_backend_dev_backend_reg(dev);
++    return reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
++}
++
++#if defined(__linux__)
++struct llama_mmap_release_stats {
++    size_t advised_bytes = 0;
++    size_t advised_tensors = 0;
++    size_t skipped_tensors = 0;
++    size_t failures = 0;
++};
++
++static void llama_mmap_release_copied(
++        const llama_mmap & mapping, size_t offset, size_t size,
++        const ggml_tensor * tensor, llama_mmap_release_stats & stats) {
++    // These exact CUDA buffer implementations finish reading the source before tensor_set returns.
++    if (!tensor->buffer || tensor->view_src) {
++        ++stats.skipped_tensors;
++        return;
++    }
++    auto * buft = ggml_backend_buffer_get_type(tensor->buffer);
++    auto * dev = ggml_backend_buft_get_device(buft);
++    if (!llama_mmap_cuda_device(dev) ||
++            (buft != ggml_backend_dev_host_buffer_type(dev) && buft != ggml_backend_dev_buffer_type(dev))) {
++        ++stats.skipped_tensors;
++        return;
++    }
++    const long page_size = sysconf(_SC_PAGESIZE);
++    const uintptr_t base = reinterpret_cast<uintptr_t>(mapping.addr());
++    if (page_size <= 0 || offset > mapping.size() || size > mapping.size() - offset ||
++            mapping.size() > UINTPTR_MAX - base) {
++        ++stats.skipped_tensors;
++        return;
++    }
++    const uintptr_t begin = base + offset;
++    const uintptr_t end = begin + size;
++    const uintptr_t dest = reinterpret_cast<uintptr_t>(tensor->data);
++    if (dest >= base && dest < base + mapping.size()) {
++        ++stats.skipped_tensors;
++        return;
++    }
++    const uintptr_t page = static_cast<uintptr_t>(page_size);
++    const uintptr_t prefix = (page - begin % page) % page;
++    if (prefix >= size) {
++        ++stats.skipped_tensors;
++        return;
++    }
++    const uintptr_t first = begin + prefix;
++    const uintptr_t last = end - end % page;
++    if (last <= first) {
++        ++stats.skipped_tensors;
++        return;
++    }
++    // Keep the immutable file mapping: validators and future duplicate loads may refault it.
++    if (madvise(reinterpret_cast<void *>(first), last - first, MADV_DONTNEED) != 0) {
++        if (stats.failures++ == 0) {
++            LLAMA_LOG_WARN("%s: MADV_DONTNEED failed: %s\n", __func__, std::strerror(errno));
++        }
++        return;
++    }
++    stats.advised_bytes += last - first;
++    ++stats.advised_tensors;
++}
++#endif
+ 
+ static const size_t kiB = 1024;
+ static const size_t MiB = 1024*kiB;
+@@ -1206,9 +1288,15 @@
+             }
+         }
+ 
+-        // avoid using a host buffer when using mmap
++        // Keep only selected CPU expert weights in their original allocated CUDA host buffer.
+         auto * buft_dev = ggml_backend_buft_get_device(buft);
+-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
++        const bool keep_cpu_moe_host = use_mmap && op == GGML_OP_MUL_MAT_ID &&
++                llama_mmap_experiment_enabled("LLAMA_MMAP_KEEP_CPU_MOE_HOST") &&
++                llama_mmap_cuda_device(buft_dev) && buft == ggml_backend_dev_host_buffer_type(buft_dev);
++        if (keep_cpu_moe_host) {
++            LLAMA_LOG_DEBUG("%s: mmap retains %s in %s\n", __func__, tn.str().c_str(), ggml_backend_buft_name(buft));
++        }
++        if (use_mmap && !keep_cpu_moe_host && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+             if (!cpu_dev) {
+                 throw std::runtime_error("no CPU backend found");
+@@ -1429,6 +1517,11 @@
+     }
+     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
+ 
++#if defined(__linux__)
++    const bool release_copied = use_mmap && !lmlocks && llama_mmap_experiment_enabled("LLAMA_MMAP_RELEASE_COPIED");
++    llama_mmap_release_stats release_stats;
++#endif
++
+     std::vector<no_init<uint8_t>> read_buf;
+     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
+ 
+@@ -1572,6 +1665,11 @@
+                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+             } else {
+                 ggml_backend_tensor_set(cur, data, 0, n_size);
++#if defined(__linux__)
++                if (release_copied) {
++                    llama_mmap_release_copied(*mapping, weight->offs, n_size, cur, release_stats);
++                }
++#endif
+             }
+         } else {
+             const auto & file = files.at(weight->idx);
+@@ -1676,6 +1774,14 @@
+         throw std::runtime_error("found tensors with invalid data");
+     }
+ 
++#if defined(__linux__)
++    if (release_copied) {
++        LLAMA_LOG_INFO("%s: mmap release advised %zu bytes across %zu copied tensors; skipped %zu, failures %zu\n",
++                __func__, release_stats.advised_bytes, release_stats.advised_tensors,
++                release_stats.skipped_tensors, release_stats.failures);
++    }
++#endif
++
+     // check if this is the last call and do final cleanup
+     if (size_done >= size_data) {
+         // unmap offloaded tensors and metadata
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -27,6 +27,7 @@
+ #include <cassert>
+ #include <cfloat>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <cmath>
+ #include <functional>
+@@ -1554,7 +1555,12 @@
+         }
+     }
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    const char * mmap_no_prefetch_env = std::getenv("LLAMA_MMAP_NO_PREFETCH");
++    const bool mmap_no_prefetch = mmap_no_prefetch_env && std::strcmp(mmap_no_prefetch_env, "1") == 0;
++    if (ml.use_mmap && mmap_no_prefetch) {
++        LLAMA_LOG_INFO("%s: mmap prefetch disabled by LLAMA_MMAP_NO_PREFETCH\n", __func__);
++    }
++    ml.init_mappings(!mmap_no_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers

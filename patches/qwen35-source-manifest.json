@@ -1,0 +1,35 @@
+{
+  "base_commit": "bd1bf025fc55ffa1fcb2ba6d8bb8805f35671d1f",
+  "files": [
+    {
+      "path": "ggml/src/ggml-backend.cpp",
+      "before_sha256": "595158bad2ea88bd8a02d45812e110829ce5bfdd1dc980aba8843a0ed7fb1a45",
+      "after_sha256": "fe098c68c5773228653e84d090cafdd6a4ee50859ab4d958a10793d73b140276"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
+      "before_sha256": "74f239b927310cdfbfaa193511d2973886be7a1e3b4dd74a8fb8ca9d0263b623",
+      "after_sha256": "4d61a8f2d1bec716eaef9dee3ea58aefd53b2b7c8fcf3430a3da6e4935d499f4"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/moe-cache.cu",
+      "before_sha256": "0f727379798cb442154677754b2900c92a26f0ec5f0ee60f2c585c950f17dd83",
+      "after_sha256": "423715fa5f752404e01320fffc0a0c7b399bb34a8b0f153e1cdde840639d2a82"
+    },
+    {
+      "path": "ggml/src/ggml-cpu/ggml-cpu.c",
+      "before_sha256": "fbf47188354c15ddd26765f88156eeb288a69ec470dd12ebffef1223efaaac68",
+      "after_sha256": "eb2872ec45977393a7f82736a20f4bece752f04a0a91da4baa279b7f33a4e6c6"
+    },
+    {
+      "path": "src/llama-model-loader.cpp",
+      "before_sha256": "0e8f6b0265737da853ee1ccf2558caa218af924b683252bb9ca3d2f232ef55b1",
+      "after_sha256": "c9638181af08ab9e62a946468910605a564e680742e1a0043a810f8a7c80e668"
+    },
+    {
+      "path": "src/llama-model.cpp",
+      "before_sha256": "fc4454f550dee2db81fcf6dd21a66ef4f93c9f11b8a66f50c89c29e1277b8e51",
+      "after_sha256": "9cec4e00e22333ca404ad18d6e1ca019a3166f603943aeeaf2113c47b7677609"
+    }
+  ]
+}
